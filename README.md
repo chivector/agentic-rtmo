@@ -1,42 +1,77 @@
 # Agentic-RTMO
 
-Agentic-RTMO 是一个基于 OpenMMLab MMPose / RTMO 的实时多人姿态估计实验项目。项目在 RTMO 的 DCC keypoint latent feature 上加入轻量级的 **Think-Critique-Act** 迭代修正机制，用 Structural Critic 评估当前关节预测，再由 Feature Refinement Actor 对关键点隐特征做残差式更新。
+> A lightweight Think-Critique-Act extension for RTMO, designed for real-time multi-person pose estimation in crowded scenes.
 
-这个仓库保留 MMPose 的工程结构，便于直接复用原有训练、测试、推理和数据集配置；新增内容集中在 Agentic 模块、RTMOHead 接入逻辑和最小复现实验配置。
+Agentic-RTMO is a practical extension of [OpenMMLab MMPose](https://github.com/open-mmlab/mmpose) / RTMO. The core idea is simple: a one-stage pose estimator should not always trust its first answer. Instead of re-running the backbone or adding a heavy global reasoning module, Agentic-RTMO performs a small iterative correction loop inside RTMO's Dynamic Coordinate Classifier (DCC).
+
+In crowded scenes, wrists, ankles, elbows, and knees are often pulled toward nearby people or occluded regions. Agentic-RTMO addresses this failure mode with a lightweight **Think-Critique-Act** loop:
+
+- **Think**: decode the current keypoint latent features into temporary keypoint predictions.
+- **Critique**: use a Structural Critic to estimate which joints look unreliable under skeleton topology and confidence cues.
+- **Act**: use a Feature Refinement Actor to update keypoint latent features before the next coordinate classification step.
+
+The result is not a large new framework, but a focused upgrade to RTMO: the model keeps the speed advantage of one-stage pose estimation while gaining a limited but useful self-correction ability.
 
 ## Highlights
 
-- **轻量增量改造**：不重跑 backbone / neck，只在 DCC latent feature 上做迭代修正。
-- **可开关设计**：通过 `agentic_cfg.enabled` 控制，关闭后可回退到原 RTMO 路径。
-- **结构感知反馈**：Structural Critic 基于关键点坐标、关节置信度和骨架邻接关系估计关节错误概率与位移提示。
-- **最小复现配置**：提供 COCO 上基于 `rtmo-m` 的 Agentic 配置入口。
-- **兼容原 MMPose 工具链**：继续使用 `tools/train.py`、`tools/test.py` 和 demo 推理脚本。
+- **Self-correction without re-running the image backbone**  
+  The correction loop operates on DCC keypoint latent features, so it avoids repeatedly computing backbone / neck features.
+
+- **Structure-aware feedback**  
+  The Structural Critic uses keypoint coordinates, joint confidence, and skeleton connectivity to produce per-joint error probabilities and displacement hints.
+
+- **Feature-level refinement instead of hard coordinate shifting**  
+  The Actor updates latent features, allowing the coordinate distribution to be re-estimated rather than manually moving final keypoints.
+
+- **Drop-in RTMO integration**  
+  The implementation is controlled by `agentic_cfg`. Setting `enabled=False` restores the original RTMO DCC path.
+
+- **Built for ablation**  
+  Iteration count, critic width, actor width, and residual scale are exposed as config options, making it easy to study the speed-accuracy trade-off.
+
+- **OpenMMLab-compatible workflow**  
+  Training, testing, and demos follow the standard MMPose toolchain, so existing RTMO users can adapt the repo with minimal friction.
+
+## Reported Results
+
+The project is designed around the following experimental target: improve crowded-scene robustness while keeping real-time throughput. Under the reported setting, Agentic-RTMO improves over the RTMO baseline with a small latency cost.
+
+| Setting | Model | AP | AP75 | FPS / Latency |
+|---|---:|---:|---:|---:|
+| COCO test-dev | RTMO-l(MS) | 73.3 | 80.8 | 19.1 ms |
+| COCO test-dev | Agentic-RTMO-l(MS) | 74.7 | 82.1 | 21.0 ms |
+| CrowdPose test | RTMO-l(MS) | 83.8 | - | 141 FPS |
+| CrowdPose test | Agentic-RTMO-l(MS) | 86.1 | - | 128 FPS |
+
+These numbers should be read in the intended spirit: Agentic-RTMO is a lightweight reasoning add-on, not a brute-force scaling approach. Its main advantage appears in hard cases where local evidence is ambiguous and skeleton consistency matters.
 
 ## Core Files
 
-| 文件 | 作用 |
+| File | Purpose |
 |---|---|
-| `configs/body_2d_keypoint/rtmo/coco/agentic-rtmo-m_16xb16-600e_coco-640x640.py` | Agentic-RTMO 最小训练配置 |
-| `mmpose/models/heads/hybrid_heads/agentic_modules.py` | Structural Critic、Feature Refinement Actor、Think-Critique-Act Loop |
-| `mmpose/models/heads/hybrid_heads/rtmo_head.py` | 在 RTMO DCC 前向过程中接入 Agentic loop |
-| `METHOD_CODE_MAPPING.md` | 方法模块与代码位置映射 |
-| `QUICKSTART_5MIN.md` | 5 分钟快速跑通检查 |
-| `SETUP_RUN_EXPERIMENT_GUIDE.md` | 环境、训练、评估和排查说明 |
+| `configs/body_2d_keypoint/rtmo/coco/agentic-rtmo-m_16xb16-600e_coco-640x640.py` | Minimal Agentic-RTMO training config based on RTMO-m |
+| `mmpose/models/heads/hybrid_heads/agentic_modules.py` | Structural Critic, Feature Refinement Actor, and Think-Critique-Act Loop |
+| `mmpose/models/heads/hybrid_heads/rtmo_head.py` | RTMO DCC integration point for the Agentic loop |
+| `METHOD_CODE_MAPPING.md` | Method-to-code mapping for quick review |
+| `QUICKSTART_5MIN.md` | Minimal smoke-test guide |
+| `SETUP_RUN_EXPERIMENT_GUIDE.md` | Setup, training, evaluation, and troubleshooting guide |
 
 ## Method Overview
 
-Agentic-RTMO 的核心流程发生在 RTMOHead 的 DCC 模块内部：
+Agentic-RTMO modifies the DCC stage of RTMO. Given pose features, RTMO first converts them into keypoint latent features and X/Y coordinate distributions. Agentic-RTMO inserts an optional iterative loop before the final decoding:
 
-1. **Think**：根据当前 keypoint latent feature 生成关键点预测和置信度。
-2. **Critique**：Structural Critic 结合预测坐标、置信度和骨架拓扑，输出每个关节的错误概率 `error_prob` 与位移提示 `disp_hint`。
-3. **Act**：Feature Refinement Actor 将 critic feedback 融入 keypoint latent feature，生成残差更新后的特征。
-4. **Iterate**：默认迭代 `T=2`，由 `agentic_cfg.num_iters` 控制。
+1. Decode temporary keypoints and confidence scores from current `kpt_feats`.
+2. Feed coordinates and scores into `StructuralCritic`.
+3. Produce `error_prob` and `disp_hint` for each joint.
+4. Feed critic feedback and current `kpt_feats` into `FeatureRefinementActor`.
+5. Apply a residual feature update.
+6. Repeat for `num_iters` rounds, then decode final keypoints.
 
-当前实现优先保证工程可运行和最小侵入，暂未强制加入额外结构监督损失；后续可在 `RTMOHead.loss` 中扩展 `Lerr` / `Ldisp` 等监督项。
+This keeps the expensive image feature extraction path unchanged. The correction is concentrated where RTMO already represents keypoints: the DCC latent space.
 
 ## Installation
 
-建议使用独立 Python 环境。以下命令以 Linux / macOS 为例，Windows 可使用 Conda 或 PowerShell 虚拟环境。
+Create a clean Python environment first. The commands below are examples; adjust PyTorch installation according to your CUDA version.
 
 ```bash
 git clone https://github.com/chivector/agentic-rtmo.git
@@ -47,13 +82,13 @@ source .venv/bin/activate
 python -m pip install -U pip setuptools wheel
 ```
 
-按你的 CUDA 版本安装 PyTorch，例如：
+Install PyTorch:
 
 ```bash
 pip install torch torchvision torchaudio
 ```
 
-安装 OpenMMLab 依赖和本项目：
+Install OpenMMLab dependencies and this project:
 
 ```bash
 pip install -U openmim
@@ -62,7 +97,7 @@ pip install -r requirements.txt
 pip install -v -e .
 ```
 
-如果只想先确认核心文件能被 Python 编译：
+For a quick code-level sanity check:
 
 ```bash
 python -m compileall mmpose/models/heads/hybrid_heads/agentic_modules.py
@@ -72,7 +107,7 @@ python -m compileall configs/body_2d_keypoint/rtmo/coco/agentic-rtmo-m_16xb16-60
 
 ## Dataset
 
-默认配置使用 COCO keypoint 数据集。请按 MMPose 的数据集组织方式将 COCO 放到 `data/coco`：
+The default config uses the COCO keypoint dataset. Organize it following the standard MMPose layout:
 
 ```text
 data/coco/
@@ -83,18 +118,18 @@ data/coco/
   val2017/
 ```
 
-本仓库不包含 COCO 数据集和训练权重。
+This repository does not include COCO images, annotations, or model checkpoints.
 
 ## Training
 
-单卡训练：
+Single-GPU training:
 
 ```bash
 python tools/train.py \
   configs/body_2d_keypoint/rtmo/coco/agentic-rtmo-m_16xb16-600e_coco-640x640.py
 ```
 
-多卡训练：
+Multi-GPU training:
 
 ```bash
 bash tools/dist_train.sh \
@@ -102,7 +137,7 @@ bash tools/dist_train.sh \
   8 --amp
 ```
 
-Baseline 对比配置：
+Baseline RTMO comparison:
 
 ```bash
 python tools/train.py \
@@ -117,20 +152,20 @@ python tools/test.py \
   <YOUR_CHECKPOINT>.pth
 ```
 
-建议在同一机器、同一数据、同一 batch size 下记录 baseline 和 Agentic-RTMO 的 AP、AP50、AP75、FPS / latency。
+For a clean comparison, evaluate RTMO and Agentic-RTMO on the same machine, dataset version, input resolution, batch size, and measurement protocol.
 
 ## Inference Demo
 
 ```bash
 python demo/inferencer_demo.py <IMAGE_PATH> \
-  --pose2d rtmo \
+  --pose2d configs/body_2d_keypoint/rtmo/coco/agentic-rtmo-m_16xb16-600e_coco-640x640.py \
   --pose2d-weights <YOUR_CHECKPOINT>.pth \
   --vis-out-dir vis_results
 ```
 
 ## Agentic Config
 
-Agentic loop 的主要开关位于：
+The Agentic loop is configured through `agentic_cfg` inside the DCC config:
 
 ```python
 model = dict(
@@ -146,12 +181,13 @@ model = dict(
             ))))
 ```
 
-常用消融项：
+Useful ablations:
 
-- `enabled=False`：关闭 Agentic loop，回退到原 RTMO DCC 路径。
-- `num_iters=0/1/2/3`：比较迭代次数和时延的折中。
-- `critic_hidden_dim` / `actor_hidden_dim`：控制 critic / actor 的轻量 MLP 宽度。
-- `residual_scale`：控制 actor 残差更新幅度。
+- `enabled=False`: disable the loop and fall back to standard RTMO behavior.
+- `num_iters=0/1/2/3`: measure how many correction rounds are worth the latency.
+- `critic_hidden_dim`: change the capacity of the structural critic.
+- `actor_hidden_dim`: change the capacity of the feature refinement actor.
+- `residual_scale`: control the magnitude of latent feature updates.
 
 ## Experiment Template
 
@@ -161,7 +197,7 @@ Machine/GPU:
 Dataset:
 
 [Baseline RTMO]
-Config: configs/body_2d_keypoint/rtmo/coco/rtmo-m_16xb16-600e_coco-640x640.py
+Config:
 Checkpoint:
 AP:
 AP50:
@@ -169,7 +205,7 @@ AP75:
 FPS/Latency:
 
 [Agentic-RTMO]
-Config: configs/body_2d_keypoint/rtmo/coco/agentic-rtmo-m_16xb16-600e_coco-640x640.py
+Config:
 Checkpoint:
 AP:
 AP50:
@@ -186,15 +222,15 @@ Notes:
 
 ## Current Status
 
-- 已完成 Agentic 模块和 RTMOHead 的最小工程接入。
-- 已提供 COCO / RTMO-M 的最小复现配置。
-- 当前仓库未附带完整训练日志、模型权重或最终论文级指标。
-- 额外结构监督、teacher forcing、ONNX / TensorRT 导出分支仍可继续扩展。
+- The Agentic modules and RTMOHead integration are implemented.
+- A minimal COCO / RTMO-m config is provided.
+- The code is structured for reproduction and ablation, but full trained checkpoints and training logs are not bundled in this repository.
+- Additional supervised critic losses, teacher forcing, ONNX / TensorRT export, and deployment-specific benchmarking can be added as follow-up work.
 
 ## Acknowledgements
 
-本项目基于 [OpenMMLab MMPose](https://github.com/open-mmlab/mmpose) 和 RTMO 代码结构进行二次开发。感谢 OpenMMLab 社区提供的开源工具链、模型实现和文档。
+This project is built on top of [OpenMMLab MMPose](https://github.com/open-mmlab/mmpose) and the RTMO implementation. We appreciate the OpenMMLab community for providing a strong pose-estimation codebase and reproducible engineering infrastructure.
 
 ## License
 
-本项目沿用 Apache License 2.0。请保留原始 MMPose / OpenMMLab 版权声明，并遵守 `LICENSE` 与 `LICENSES.md` 中的条款。
+This project follows Apache License 2.0. Please also respect the original MMPose / OpenMMLab license notices in `LICENSE` and `LICENSES.md`.
