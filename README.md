@@ -12,6 +12,12 @@ In crowded scenes, wrists, ankles, elbows, and knees are often pulled toward nea
 
 The result is not a large new framework, but a focused upgrade to RTMO: the model keeps the speed advantage of one-stage pose estimation while gaining a limited but useful self-correction ability.
 
+## Demo
+
+![Agentic-RTMO Think-Critique-Act demo](demo/resources/agentic_rtmo_tca_demo_ppt.gif)
+
+[Watch the full MP4 demo with voiceover](demo/resources/agentic_rtmo_tca_demo_ppt.mp4)
+
 ## Highlights
 
 - **Self-correction without re-running the image backbone**  
